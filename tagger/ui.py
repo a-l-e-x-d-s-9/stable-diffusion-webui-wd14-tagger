@@ -7,14 +7,16 @@ from pathlib import Path
 from glob import glob
 from PIL import Image, UnidentifiedImageError
 
-from webui import wrap_gradio_gpu_call
+from modules.call_queue import wrap_gradio_gpu_call
 from modules import ui
 from modules import generation_parameters_copypaste as parameters_copypaste
 
 from tagger import format, utils
 from tagger.utils import split_str
 from tagger.interrogator import Interrogator
-
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from tqdm import tqdm
 
 def unload_interrogators():
     unloaded_models = 0
@@ -88,7 +90,7 @@ def on_interrogate(
     batch_output_filename_format = batch_output_filename_format.strip()
 
     if batch_input_glob != '':
-        # if there is no glob pattern, insert it automatically
+                # if there is no glob pattern, insert it automatically
         if not batch_input_glob.endswith('*'):
             if not batch_input_glob.endswith(os.sep):
                 batch_input_glob += os.sep
@@ -117,88 +119,27 @@ def on_interrogate(
         ]
 
         print(f'found {len(paths)} image(s)')
-
-        for path in paths:
-            try:
-                image = Image.open(path)
-            except UnidentifiedImageError:
-                # just in case, user has mysterious file...
-                print(f'${path} is not supported image type')
-                continue
-
-            # guess the output path
-            base_dir_last = Path(base_dir).parts[-1]
-            base_dir_last_idx = path.parts.index(base_dir_last)
-            output_dir = Path(
-                batch_output_dir) if batch_output_dir else Path(base_dir)
-            output_dir = output_dir.joinpath(
-                *path.parts[base_dir_last_idx + 1:]).parent
-
-            output_dir.mkdir(0o777, True, True)
-
-            # format output filename
-            format_info = format.Info(path, 'txt')
-
-            try:
-                formatted_output_filename = format.pattern.sub(
-                    lambda m: format.format(m, format_info),
-                    batch_output_filename_format
-                )
-            except (TypeError, ValueError) as error:
-                return ['', None, None, str(error)]
-
-            output_path = output_dir.joinpath(
-                formatted_output_filename
-            )
-
-            output = []
-
-            if output_path.is_file():
-                output.append(output_path.read_text(errors='ignore').strip())
-
-                if batch_output_action_on_conflict == 'ignore':
-                    print(f'skipping {path}')
-                    continue
-
-            ratings, tags = interrogator.interrogate(image)
-            processed_tags = Interrogator.postprocess_tags(
-                tags,
-                *postprocess_opts
-            )
-
-            # TODO: switch for less print
-            print(
-                f'found {len(processed_tags)} tags out of {len(tags)} from {path}'
-            )
-
-            plain_tags = ', '.join(processed_tags)
-
-            if batch_output_action_on_conflict == 'copy':
-                output = [plain_tags]
-            elif batch_output_action_on_conflict == 'prepend':
-                output.insert(0, plain_tags)
-            else:
-                output.append(plain_tags)
-
-            if batch_remove_duplicated_tag:
-                output_path.write_text(
-                    ', '.join(
-                        OrderedDict.fromkeys(
-                            map(str.strip, ','.join(output).split(','))
-                        )
-                    ),
-                    encoding='utf-8'
-                )
-            else:
-                output_path.write_text(
-                    ', '.join(output),
-                    encoding='utf-8'
-                )
-
-            if batch_output_save_json:
-                output_path.with_suffix('.json').write_text(
-                    json.dumps([ratings, tags])
-                )
+        # Create a tqdm object
+        progress_bar = tqdm(total=len(paths), desc="Processing images", dynamic_ncols=True)
+        
+        # Create a new function with the non-iterable arguments "filled in"
+        process_image_partial = partial(process_image, base_dir=base_dir, batch_output_dir=batch_output_dir,
+                                batch_output_filename_format=batch_output_filename_format,
+                                batch_output_action_on_conflict=batch_output_action_on_conflict,
+                                postprocess_opts=postprocess_opts, 
+                                batch_remove_duplicated_tag=batch_remove_duplicated_tag,
+                                batch_output_save_json=batch_output_save_json,
+                                interrogator = interrogator,
+                                progress_bar = progress_bar)
+        
+        # ThreadPoolExecutor context management
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # Use `executor.map` to run the function on each path in the paths list
+            # Pass other parameters required by the function as well
+            results = list(executor.map(process_image_partial, paths))
+            
+        # Close the progress bar
+        progress_bar.close()
 
         print('all done :)')
 
@@ -206,6 +147,78 @@ def on_interrogate(
         interrogator.unload()
 
     return ['', None, None, '']
+
+def process_image(path, base_dir, batch_output_dir, batch_output_filename_format, 
+                  batch_output_action_on_conflict, postprocess_opts, 
+                  batch_remove_duplicated_tag, batch_output_save_json, interrogator, progress_bar):
+    try:
+        image = Image.open(path)
+    except UnidentifiedImageError:
+        print(f'{path} is not a supported image type')
+        return
+
+    base_dir_last = Path(base_dir).parts[-1]
+    base_dir_last_idx = path.parts.index(base_dir_last)
+    output_dir = Path(batch_output_dir) if batch_output_dir else Path(base_dir)
+    output_dir = output_dir.joinpath(*path.parts[base_dir_last_idx + 1:]).parent
+
+    output_dir.mkdir(0o777, True, True)
+
+    format_info = format.Info(path, 'txt')
+
+    try:
+        formatted_output_filename = format.pattern.sub(
+            lambda m: format.format(m, format_info),
+            batch_output_filename_format
+        )
+    except (TypeError, ValueError) as error:
+        return ['', None, None, str(error)]
+
+    output_path = output_dir.joinpath(formatted_output_filename)
+
+    output = []
+
+    if output_path.is_file():
+        output.append(output_path.read_text(errors='ignore').strip())
+        if batch_output_action_on_conflict == 'ignore':
+            print(f'skipping {path}')
+            return
+
+    ratings, tags = interrogator.interrogate(image)
+    processed_tags = interrogator.postprocess_tags(tags, *postprocess_opts)
+
+    #print(f'found {len(processed_tags)} tags out of {len(tags)} from {path}')
+
+    plain_tags = ', '.join(processed_tags)
+
+    if batch_output_action_on_conflict == 'copy':
+        output = [plain_tags]
+    elif batch_output_action_on_conflict == 'prepend':
+        output.insert(0, plain_tags)
+    else:
+        output.append(plain_tags)
+
+    if batch_remove_duplicated_tag:
+        output_path.write_text(
+            ', '.join(
+                OrderedDict.fromkeys(
+                    map(str.strip, ','.join(output).split(','))
+                )
+            ),
+            encoding='utf-8'
+        )
+    else:
+        output_path.write_text(
+            ', '.join(output),
+            encoding='utf-8'
+        )
+
+    if batch_output_save_json:
+        output_path.with_suffix('.json').write_text(
+            json.dumps([ratings, tags])
+        )
+        
+    progress_bar.update(1)
 
 
 def on_ui_tabs():

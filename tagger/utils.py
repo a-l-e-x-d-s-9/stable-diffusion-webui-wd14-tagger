@@ -59,6 +59,10 @@ def refresh_interrogators() -> List[str]:
             'wd14-convnext',
             repo_id='SmilingWolf/wd-v1-4-convnext-tagger'
         ),
+        'wd-v1-4-moat-tagger-v2': WaifuDiffusionInterrogator(
+            'wd-v1-4-moat-tagger-v2',
+            repo_id='SmilingWolf/wd-v1-4-moat-tagger-v2'
+        ),
     }
 
     # load deepdanbooru project

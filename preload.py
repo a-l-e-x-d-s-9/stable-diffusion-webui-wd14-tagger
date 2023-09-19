@@ -1,7 +1,7 @@
 from pathlib import Path
 from argparse import ArgumentParser
 
-from modules.shared import models_path
+from modules.paths_internal import models_path
 
 default_ddp_path = Path(models_path, 'deepdanbooru')
 
